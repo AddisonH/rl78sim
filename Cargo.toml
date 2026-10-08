@@ -1,0 +1,18 @@
+[package]
+name = "rl78sim"
+version = "0.1.0"
+edition = "2024"
+description = "Instruction-level simulator for the Renesas RL78 (S1/S2/S3 cores) with a clock model from the RL78 Software Manual"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
