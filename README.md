@@ -1,118 +1,253 @@
 # rl78sim
 
-An instruction-level simulator for the Renesas RL78 (S1/S2/S3 cores) with a
-clock model taken from the RL78 Family Software Manual. It is meant for
-benchmarking (exact instruction counts, per-PC profiles, real clock counts)
-and for running compiler tests, in place of the simulator built into
-`rl78-elf-gdb`. It is written in Rust.
+A fast instruction-level simulator for the Renesas RL78 (S1, S2 and S3
+cores). It runs an ELF file from the reset vector and tells you exactly how
+many instructions and CPU clocks it took, where they were spent, and whether
+the program did anything a real part would not allow.
 
-The assembler and linker its tests use come from an LLVM with the RL78
-target, for example <https://github.com/AddisonH/rl78-llvm>.
+It is a single command-line program written in Rust, with no licence server
+and no dependencies beyond a Rust toolchain.
+
+## What it is good for
+
+- **Measuring code.** Clock counts follow the RL78 Family Software Manual,
+  including the cases the simpler simulators leave out (flash read as data,
+  branch taken/not taken, skipped instructions, the wait after writing a
+  register that the next instruction addresses through). CC-RL's EEMBC
+  CoreMark measures 577,093 clocks per iteration here; Renesas publishes
+  582,411 cycles for the hardware, a difference of 0.9%.
+- **Finding where the time goes.** One option gives clocks and instructions
+  per function and per instruction address, for the whole run or for a region
+  between two symbols.
+- **Running tests.** The program's UART0 output goes to stdout and its exit
+  code becomes the simulator's, so a test is a plain shell command. Start-up
+  takes about 2 ms and runs are deterministic.
+- **Catching layout mistakes.** By default a store to flash or to the flash
+  mirror, or an access to reserved address space, stops the run with a
+  message instead of silently corrupting something. A mislinked `.data`
+  section shows up at its first store rather than as a wrong result later.
+- **Speed.** About 110 million simulated instructions per second with every
+  counter on: a 258-million-instruction CoreMark run takes 2.3 s.
+
+It does not model interrupts or peripherals (see [Limits](#limits)), so it
+is for compiler, library and algorithm work, not for firmware that depends
+on timers or I/O.
+
+## Build
 
 ```sh
-cargo build --release
-target/release/rl78sim prog.elf                       # run; UART0 output on stdout, exit code = program's
-target/release/rl78sim --start cm_region_start --stop cm_region_end \
-    --stats - --profile prof.json prog.elf             # measure a region
-target/release/rl78sim --trace prog.elf 2>trace.txt   # PC, disassembly, registers per instruction
+cargo build --release        # the binary is target/release/rl78sim
 ```
 
-Speed: ~110M instructions/s (a 258M-instruction CoreMark run in 2.3 s,
-Embench at 90-117M/s) and ~2 ms startup, with every counter and the clock
-model on. Where the time goes: the decode cache, a per-core
-table of precomputed per-encoding data (`OpInfo`), specialised handlers for
-the frequent encodings, and one event flag for everything rare (see
-`Cpu::step_impl`).
+## Use
 
-## Where the facts come from
+Run a program:
 
-- `isa/rl78.tsv` — every encoding (1224) with its S1/S2/S3 clocks, extracted
-  from the Software Manual (R01US0015EJ0230 Rev.2.30, Tables 5-5..5-8) by
-  `tools/extract_manual.py` + `tools/join_isa.py` (which checks that every
-  encoding matches exactly one operation-list row with the same length).
-  `tools/check_encodings.py` assembles every row with llvm-mc and compares the
-  bytes: 1224/1224 agree. The manuals are Renesas documents and are not part
-  of this repository.
-- Instruction semantics: chapter 6 of the Software Manual.
-- Clock model (chapters 5 and 7): operation-list clocks for the selected
-  core; "note 2" clocks when code flash is read as data (also through the
-  mirror); not taken/taken for conditional branches; a skipped instruction
-  costs 1 clock (2 with an ES: prefix); +1 wait when an instruction addresses
-  memory through a register (or uses SP/CS) written by the previous
-  instruction (7.2.3); instructions fetched from RAM are charged the manual's
-  maximum (2n+3, S1 4n+6) and counted separately.
-- G13 multiplier/divider (S2 objects with `EF_RL78_FU_EXIST`): R01UH0146
-  chapter 14.
-- Core selection: `--core`, else the ELF flags (`EF_RL78_CPU_*`,
-  `EF_RL78_EI_EXIST`); instructions the core lacks (MULHU on S2, SEL on S1)
-  stop the run as illegal.
+```sh
+rl78sim prog.elf             # UART0 output on stdout; exit code = the program's
+```
 
-## Accuracy
+Measure the region between two symbols (addresses work too):
 
-- **Hardware:** CC-RL's EEMBC CoreMark measures 577,093 clocks/iteration;
-  Renesas publishes 582,411 cycles (−0.9%). The rl78-elf-gdb trace harness's
-  floor said 539,735 (−7.3%).
-- **Against rl78-elf-gdb** (`tools/lockstep.py`): register state compared
-  after every instruction. A complete newlib program (111k instructions)
-  and CoreMark agree; `tools/fuzz_isa.py` builds random programs from the
-  whole encoding table (memory operands steered into scratch windows, memory
-  read back at the end): 300/300 programs × ~1,900 instructions agree.
-- **Against the manuals** (`tests/asm/*.s`, run by `cargo test`): flags,
-  multiply/divide/MAC incl. overflow, shifts, stack frames, addressing modes,
-  banks, the MDU (the G13 manual's own examples), traps, and clock counts.
+```sh
+rl78sim --start bench_begin --stop bench_end --stats - prog.elf
+```
 
-### rl78-elf-gdb deviations from the manual (rl78sim follows the manual)
+`--stats` writes JSON to a file, or to stderr with `-`:
 
-`--quirks gdb` reproduces 1-4 so lockstep comparison can be exact; AC is
-masked instead (it is never read by compiled code).
+```json
+{
+  "core": "s3",
+  "exit_code": 0,
+  "region": {
+    "instrs": 12960426,
+    "clocks": 17454271,
+    "branches_taken": 173911,
+    "branches_not_taken": 172,
+    "skipped": 140933,
+    "flash_data_reads": 696320,
+    "hazard_waits": 1,
+    "ram_fetch_instrs": 0
+  },
+  "region_mix": { "movw": 6487524, "xch": 1044484, "addw": 1044502, "...": 0 },
+  "stop": "reached 0x021ea",
+  "total": { "...": 0 }
+}
+```
 
-1. MACH sets CY whenever MACR changes sign; the manual: signed overflow.
-2. CMPS sets CY like CMP; the manual: result ≠ 0, or A = 0, or X = 0.
-3. MOVS always clears CY; the manual: A = 0 or the source = 0.
-4. PUSH PSW / POP PSW use the low stack byte for PSW; the manual: (SP-1) for
-   PUSH, (SP+1) for POP, with 00H in the other byte.
-5. AC is computed by a generic before/after heuristic (for CMP from the
-   source operand); the manual: carry/borrow between bits 3 and 4.
-6. MACR is not reset (the manual: 0000H).
-7. Stores to the flash mirror go through to flash (hardware: read-only).
-8. A misaligned word access is a fatal trap; hardware ignores address bit 0.
+`region` counts from the first time `--start` is reached until `--stop`;
+`total` counts the whole run. `region_mix` is the number of times each
+mnemonic ran. `hazard_waits` are the one-clock waits of Software Manual
+7.2.3, and `ram_fetch_instrs` are instructions executed from RAM.
 
-The register-write waits (7.2.3) matter: unoptimized code hits one on
-almost every stack access, and without them the count for CC-RL's CoreMark
-would be several percent below the published hardware figure instead of
-0.9%.
+Profile it:
+
+```sh
+rl78sim --start bench_begin --stop bench_end --profile prof.json prog.elf
+```
+
+`prof.json` holds `functions` (name, instructions, clocks, sorted by clocks)
+and `pcs` (one `[address, instructions, clocks]` entry per instruction that
+ran). Joining `pcs` with a disassembly gives an annotated listing of a hot
+loop.
+
+Debug it:
+
+```sh
+rl78sim --trace prog.elf 2>trace.txt     # every instruction: PC, disassembly, registers
+rl78sim --watch 0xffe20 prog.elf         # report every store to an address
+rl78sim --dump 0xf8000:64 prog.elf       # hex dump of memory when the run ends
+rl78sim --max-clocks 100000000 prog.elf  # give up on a program that hangs
+```
+
+A trace line looks like this:
+
+```
+021f4: or a, x                      AX=0010 BC=1111 DE=1111 HL=1111 SP=fe20 PSW=06 ES=f CS=0
+```
+
+`rl78sim --help` lists every option.
+
+## What a program needs
+
+Nothing special for a program that already runs under `rl78-elf-gdb`'s
+simulator.
+
+- **Output:** a byte written to the UART0 data register SDR00 (FFF10H)
+  appears on stdout. This is what libgloss's `_write` does.
+- **Exit:** `HALT` or `STOP` ends the run with the exit code in A (libgloss's
+  `_exit`). A branch to itself ends it with the code in X (newlib's `nosys`
+  `_exit`). `BRK` with an unprogrammed vector stops the run.
+- **Verdicts:** when the result is reported by reaching one of several labels
+  rather than by an exit code, `--verdict pass --verdict fail` keeps running
+  after `--stop` and reports which was reached. `--cstr sym` prints the
+  string at a symbol when the run ends.
+
+## Cores
+
+`--core s1|s2|s3` selects the clock table and the instruction set. Without
+it the ELF header flags decide (`EF_RL78_CPU_*`), and S3 is the default. An
+instruction the core does not have (MULHU on S2, SEL on S1) stops the run as
+illegal.
+
+For an S2 object that uses it, the RL78/G13 multiplier/divider at FFFF0H is
+modelled; `--mdu true|false` overrides that.
 
 ## Memory maps
 
-- `--map strict` (default): the rl78-elf-gdb layout (code flash to EFFFFH,
-  mirror F1000H-F7FFFH ← 01000H, RAM from F8000H) with hardware semantics:
-  stores to flash or the mirror and accesses to reserved space stop the run.
-  A `.modelinfo` section (libgloss `*_modelinfo.ld`) sets the layout.
-- `--map vendor`: stores go through to flash, 2nd-SFR reads return 11H, as
-  rl78-elf-gdb does. libgloss's own
-  `rl78-sim.ld` puts RAM at F5700H, inside the mirror, so `-fsim` programs
-  need this mode.
+| Region | Addresses |
+|---|---|
+| Code flash | 00000H - EFFFFH |
+| Mirror of flash 01000H onward | F1000H - F7FFFH |
+| RAM (the register banks are its top 32 bytes) | F8000H - FFEFFH |
 
-Power-on contents match rl78-elf-gdb (FFH, 33H in F0000H-FFFFFH, 11H in the
-register banks) so runs are reproducible; RAM is undefined on hardware.
+A `.modelinfo` section in the ELF (libgloss's `*_modelinfo.ld`) changes the
+layout.
 
-I/O: UART0 SDR00 (FFF10H) → stdout (libgloss `_write`); HALT/STOP exit with
-the code in A (libgloss `_exit`); a branch to itself exits with the code in
-X (newlib's nosys `_exit`); BRK with an unprogrammed vector stops.
-Not modelled: interrupts and peripherals other than the UART0 data register
-and the G13 MDU.
+- `--map strict` (the default) has hardware semantics: stores to flash or
+  the mirror and accesses to reserved space stop the run.
+- `--map vendor` behaves like `rl78-elf-gdb`: stores go through to flash and
+  nothing is unmapped. libgloss's own `rl78-sim.ld` puts RAM at F5700H,
+  inside the mirror, so programs linked with `-fsim` need this mode.
+- `--rom-writes trap|ignore|through` overrides what a store to flash does.
+  `ignore` is what hardware does.
+- `--strict` also stops on undefined behaviour (16-bit address overflow in
+  based addressing, a misaligned word access) instead of counting it.
 
-## Tests
+Memory starts with the same contents as under `rl78-elf-gdb` (FFH in flash,
+33H in F0000H-FFFFFH, 11H in the register banks), so runs are reproducible.
+On hardware RAM is undefined at power-on.
+
+## Accuracy
+
+- **Against hardware:** CC-RL's EEMBC CoreMark, 577,093 clocks per iteration
+  against the published 582,411 cycles (-0.9%). Counting instructions plus
+  branch penalties alone gives 539,735 (-7.3%).
+- **Against `rl78-elf-gdb`:** `tools/lockstep.py` compares register state
+  after every instruction. A complete newlib program (111,000 instructions)
+  and CoreMark agree. `tools/fuzz_isa.py` builds random programs from the
+  whole encoding table; 300 of 300 programs of about 1,900 instructions
+  agree.
+- **Against the manuals:** `tests/asm/*.s` cover flags, multiply, divide and
+  multiply-accumulate including overflow, shifts, stack frames, addressing
+  modes, register banks, the G13 multiplier/divider, traps and clock counts.
+  The expected values are worked out from the manuals, not copied from a
+  simulator run.
+
+### The clock model
+
+- The operation-list clocks for the selected core (Software Manual Tables
+  5-5 to 5-8).
+- The "note 2" clocks when code flash is read as data, also through the
+  mirror.
+- Taken and not-taken clocks for conditional branches.
+- A skipped instruction costs 1 clock (2 with an `ES:` prefix).
+- One wait when an instruction addresses memory through a register, or uses
+  SP or CS, that the previous instruction wrote (7.2.3). Unoptimized code
+  hits this on almost every stack access; without it CoreMark would read
+  several percent low.
+- Instructions fetched from RAM are charged the manual's maximum (2n+3
+  clocks, 4n+6 on S1) and counted separately.
+
+### Where `rl78-elf-gdb` differs from the manual
+
+rl78sim follows the manual. `--quirks gdb` reproduces items 1 to 4 so that a
+lockstep comparison can be exact.
+
+1. MACH sets CY whenever MACR changes sign; the manual says on signed
+   overflow.
+2. CMPS sets CY like CMP; the manual says when the result is not 0, or A is
+   0, or X is 0.
+3. MOVS always clears CY; the manual says CY is set when A is 0 or the
+   source is 0.
+4. PUSH PSW and POP PSW use the low stack byte for PSW; the manual says
+   (SP-1) for PUSH and (SP+1) for POP, with 00H in the other byte.
+5. AC comes from a generic before/after heuristic; the manual says the
+   carry or borrow between bits 3 and 4.
+6. MACR is not reset; the manual says 0000H.
+7. Stores to the flash mirror go through to flash; on hardware the mirror is
+   read-only.
+8. A misaligned word access is a fatal trap; hardware ignores address bit 0.
+
+## Limits
+
+- No interrupts.
+- No peripherals other than the UART0 data register and the G13
+  multiplier/divider.
+- Clock counts are CPU clocks from the manual's tables. Anything outside
+  the core (oscillator start-up, flash wait states at high frequency) is not
+  modelled.
+
+## Where the instruction table comes from
+
+`isa/rl78.tsv` lists all 1,224 encodings with their S1, S2 and S3 clocks. It
+is extracted from the Software Manual (R01US0015EJ0230 Rev.2.30) by
+`tools/extract_manual.py` and `tools/join_isa.py`, which checks that every
+encoding matches exactly one operation-list row of the same length.
+`tools/check_encodings.py` assembles every row with `llvm-mc` and compares
+the bytes; all 1,224 agree. Instruction semantics are from chapter 6 of the
+Software Manual, the multiplier/divider from chapter 14 of the RL78/G13
+hardware manual (R01UH0146). The manuals are Renesas documents and are not
+part of this repository.
+
+## Working on the simulator
+
+The tests need `llvm-mc` and `ld.lld` from an LLVM with the RL78 target, for
+example <https://github.com/AddisonH/rl78-llvm>. The two differential tools
+also need `rl78-elf-gdb`.
 
 ```sh
-cargo test --release                  # unit + assembly tests; needs llvm-mc and ld.lld with
-                                      # the RL78 target: RL78_LLVM_BIN=<llvm build>/bin
-tools/check_encodings.py              # manual table vs llvm-mc
-tools/fuzz_isa.py --seeds 300 --length 600   # differential fuzz vs rl78-elf-gdb
-tools/lockstep.py prog.elf            # one program vs rl78-elf-gdb
+RL78_LLVM_BIN=<llvm build>/bin cargo test --release   # unit and assembly tests
+tools/check_encodings.py                              # instruction table against llvm-mc
+tools/fuzz_isa.py --seeds 300 --length 600            # random programs against rl78-elf-gdb
+tools/lockstep.py prog.elf                            # one program against rl78-elf-gdb
 ```
 
-An assembly test is a `.s` file with expectations in comments (`EXPECT:`,
-`EXPECT-MEM:`, `STOP:`, `CLOCKS:` between labels `t0`/`t1`, `UART:`);
-see `tests/asm.rs`. Expected values are worked out from the manuals, not
-copied from a simulator run.
+An assembly test is a `.s` file with its expectations in comments
+(`EXPECT:`, `EXPECT-MEM:`, `STOP:`, `UART:`, and `CLOCKS:` between the
+labels `t0` and `t1`); `tests/asm.rs` describes them.
+
+The speed comes from a decode cache, a per-core table of data precomputed
+for each encoding (`OpInfo`), specialised handlers for the frequent
+encodings, and a single event flag for everything rare. `Cpu::step_impl` is
+the place to start reading.
