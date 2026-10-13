@@ -251,3 +251,10 @@ The speed comes from a decode cache, a per-core table of data precomputed
 for each encoding (`OpInfo`), specialised handlers for the frequent
 encodings, and a single event flag for everything rare. `Cpu::step_impl` is
 the place to start reading.
+
+## Licence
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE)
+or the [MIT license](LICENSE-MIT), at your option. The RL78 manuals the
+instruction table was extracted from are Renesas documents and are not
+covered.
