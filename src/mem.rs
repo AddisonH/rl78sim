@@ -4,7 +4,11 @@
 //! The CPU registers that live in the SFR area (SP, PSW, CS, ES, PMC, MACR)
 //! and the general registers are kept in memory, so every access path (named
 //! register, saddr, !addr16, ...) sees the same storage, as on hardware.
+//!
+//! Peripherals beyond the few built in here can be modelled by the embedder
+//! with an [`Io`] hook.
 
+use std::any::Any;
 use std::fmt;
 
 pub const SIZE: usize = 1 << 20;
@@ -52,6 +56,11 @@ pub struct MemMap {
     pub strict: bool,
     /// rl78-elf-gdb quirk: every 2nd-SFR read (F0000H-F0FFFH) returns 11H.
     pub sfr2_reads_11: bool,
+    /// The 2nd SFRs are [F0000H, sfr2_end). The manual puts them at
+    /// F0000H-F07FFH on every RL78 (Architecture 3.1.4); rl78-elf-gdb treats
+    /// all of F0000H-F0FFFH as 2nd SFRs. A mirror starting below sfr2_end
+    /// (F0800H on the G15) takes precedence.
+    pub sfr2_end: u32,
 }
 
 impl MemMap {
@@ -68,6 +77,7 @@ impl MemMap {
             rom_writes: RomWrites::Through,
             strict: false,
             sfr2_reads_11: true,
+            sfr2_end: 0xF1000,
         }
     }
 
@@ -78,6 +88,7 @@ impl MemMap {
             rom_writes: RomWrites::Trap,
             strict: true,
             sfr2_reads_11: false,
+            sfr2_end: 0xF0800,
             ..MemMap::vendor()
         }
     }
@@ -117,6 +128,35 @@ impl fmt::Display for Fault {
         }
     }
 }
+
+/// Peripheral registers modelled outside the simulator.
+///
+/// An installed hook sees every data access to the SFRs below the CPU
+/// registers (FFF00H-FFFF7H) and to the 2nd SFRs, by any instruction (byte,
+/// word and bit operations alike). The G13 multiplier/divider, when enabled,
+/// keeps its own registers. Instruction fetches and `Memory::poke` do not
+/// call the hook.
+///
+/// The hook gets the memory (without itself: it is taken out for the call),
+/// so it can change other registers or reprogram flash with `poke`, and end
+/// the run after the current instruction with `Memory::stop_for_io`.
+pub trait Io: Any + Send {
+    /// A data read of `a`; `None` reads the stored byte.
+    fn read(&mut self, mem: &mut Memory, a: u32) -> Option<u8> {
+        let _ = (mem, a);
+        None
+    }
+
+    /// A store of `v` to `a`, before it happens; return `true` if the hook
+    /// has dealt with it and the byte must not be stored.
+    fn write(&mut self, mem: &mut Memory, a: u32, v: u8) -> bool {
+        let _ = (mem, a, v);
+        false
+    }
+}
+
+/// The first CPU register in the SFR area (SP); the hook stops below it.
+const IO_END: u32 = 0xFFFF8;
 
 /// RL78/G13 multiplier and divider/multiply-accumulator (R01UH0146 chapter
 /// 14). Its data registers MDAL/MDAH/MDBH/MDBL sit at FFFF0H-FFFF7H (where
@@ -162,10 +202,16 @@ pub struct Memory {
     /// Report stores that land on these (physical) addresses.
     pub watch: Vec<u32>,
     pub watch_hits: Vec<(u32, u8)>,
-    /// Set with any of `fault`, `syscall`, `wrote_code`, `watch_hits` (and by
-    /// the CPU for a pending stop): one flag for the CPU to test per
-    /// instruction.
+    /// Set with any of `fault`, `syscall`, `wrote_code`, `watch_hits`,
+    /// `io_stop` (and by the CPU for a pending stop): one flag for the CPU to
+    /// test per instruction.
     pub event: bool,
+    /// Set by `stop_for_io`.
+    pub io_stop: bool,
+    io: Option<Box<dyn Io>>,
+    /// Data accesses in [ram_start, plain_end) are plain storage: FFF00H with
+    /// an `Io` hook installed, else the end of memory.
+    plain_end: u32,
 }
 
 /// Types for which all-zero bytes are a valid value.
@@ -195,7 +241,7 @@ impl Memory {
         b[0xF0000..].fill(0x33);
         b[GPR_LO as usize..0xFFF00].fill(0x11);
         if !map.sfr2_reads_11 {
-            b[0xF0000..0xF1000].fill(0);
+            b[0xF0000..map.sfr2_end as usize].fill(0);
         }
         Memory {
             b,
@@ -213,7 +259,53 @@ impl Memory {
             watch: Vec::new(),
             watch_hits: Vec::new(),
             event: false,
+            io_stop: false,
+            io: None,
+            plain_end: SIZE as u32,
         }
+    }
+
+    /// Install `io` for the SFRs (replacing any hook already installed).
+    pub fn set_io(&mut self, io: Box<dyn Io>) {
+        self.io = Some(io);
+        self.plain_end = 0xFFF00;
+    }
+
+    /// Remove the hook, and return it.
+    pub fn take_io(&mut self) -> Option<Box<dyn Io>> {
+        self.plain_end = SIZE as u32;
+        self.io.take()
+    }
+
+    /// The installed hook, if it is a `T`.
+    pub fn io_mut<T: Io>(&mut self) -> Option<&mut T> {
+        let io: &mut dyn Any = self.io.as_deref_mut()?;
+        io.downcast_mut()
+    }
+
+    /// End the run after the current instruction with `Stop::Io` (for an
+    /// `Io` hook: a reset, a breakpoint, ...).
+    pub fn stop_for_io(&mut self) {
+        self.io_stop = true;
+        self.event = true;
+    }
+
+    #[cold]
+    fn io_read(&mut self, a: u32) -> Option<u8> {
+        let mut io = self.io.take()?;
+        let v = io.read(self, a);
+        self.io = Some(io);
+        v
+    }
+
+    #[cold]
+    fn io_write(&mut self, a: u32, v: u8) -> bool {
+        let Some(mut io) = self.io.take() else {
+            return false;
+        };
+        let done = io.write(self, a, v);
+        self.io = Some(io);
+        done
     }
 
     pub fn region(&self, a: u32) -> Region {
@@ -226,7 +318,7 @@ impl Memory {
             Region::Mirror
         } else if a >= m.ram_start {
             Region::Ram
-        } else if (0xF0000..0xF1000).contains(&a) {
+        } else if (0xF0000..m.sfr2_end).contains(&a) {
             Region::Sfr2
         } else {
             Region::Reserved
@@ -244,9 +336,22 @@ impl Memory {
     pub fn read8(&mut self, a: u32) -> u8 {
         let a = a & MASK;
         if a >= self.map.ram_start {
+            if a < self.plain_end {
+                return self.b[a as usize];
+            }
+            if a < IO_END
+                && let Some(v) = self.io_read(a)
+            {
+                return v;
+            }
             return self.b[a as usize];
         }
-        if (0xF0000..0xF1000).contains(&a) {
+        if (0xF0000..self.map.sfr2_end).contains(&a) && self.region(a) == Region::Sfr2 {
+            if self.io.is_some()
+                && let Some(v) = self.io_read(a)
+            {
+                return v;
+            }
             if a == MDUC {
                 if let Some(m) = &self.mdu {
                     let v = self.b[a as usize];
@@ -303,7 +408,7 @@ impl Memory {
         // Word accesses ignore address bit 0 on hardware ("bit 0 = 0 when an
         // odd address is specified").
         let a = a & !1;
-        if (a & MASK) >= self.map.ram_start {
+        if (a & MASK) >= self.map.ram_start && (a & MASK) < self.plain_end {
             // RAM and SFRs: plain storage for reads (as read8).
             return self.get16(a);
         }
@@ -313,6 +418,18 @@ impl Memory {
     #[inline(never)]
     fn read16_slow(&mut self, a: u32) -> u16 {
         self.read8(a) as u16 | (self.read8(a + 1) as u16) << 8
+    }
+
+    /// Note an outside store (not by an instruction) to [a, a + len): if the
+    /// CPU has decoded any of it, its decode cache is flushed before the next
+    /// instruction.
+    pub fn mark_written(&mut self, a: u32, len: usize) {
+        let a = (a & MASK) as usize;
+        let end = (a + len).min(SIZE);
+        if self.code_mark[a..end].iter().any(|&m| m != 0) {
+            self.wrote_code = true;
+            self.event = true;
+        }
     }
 
     /// Instruction fetch (no side effects; mirror reads flash).
@@ -444,6 +561,7 @@ impl Memory {
                     self.store(t, v);
                 }
             },
+            Region::Sfr2 if self.io.is_some() && self.io_write(a, v) => {}
             Region::Reserved if self.map.strict => {
                 self.event = true;
                 self.fault.get_or_insert(Fault::Unmapped {
@@ -479,6 +597,9 @@ impl Memory {
     }
 
     fn write_sfr(&mut self, a: u32, v: u8) {
+        if a < IO_END && self.io.is_some() && self.io_write(a, v) {
+            return;
+        }
         match a {
             // PSW: the CPU recomputes the register bank (at the event).
             SFR_PSW => self.event = true,
@@ -510,8 +631,10 @@ impl Memory {
         self.b[a as usize] = v;
     }
 
-    /// Load bytes without side effects (ELF loading, tests).
+    /// Load bytes without side effects other than flushing decoded code
+    /// they cover (ELF loading, a debugger, flash programming, tests).
     pub fn poke(&mut self, a: u32, data: &[u8]) {
+        self.mark_written(a, data.len());
         let a = a as usize;
         self.b[a..a + data.len()].copy_from_slice(data);
     }

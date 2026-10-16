@@ -149,6 +149,9 @@ layout.
 - `--map vendor` behaves like `rl78-elf-gdb`: stores go through to flash and
   nothing is unmapped. libgloss's own `rl78-sim.ld` puts RAM at F5700H,
   inside the mirror, so programs linked with `-fsim` need this mode.
+- The 2nd SFRs are F0000H-F07FFH, as the manual has them on every RL78;
+  `--map vendor` extends them to F0FFFH like `rl78-elf-gdb`. A mirror that
+  starts at F0800H (the RL78/G15's) takes precedence.
 - `--rom-writes trap|ignore|through` overrides what a store to flash does.
   `ignore` is what hardware does.
 - `--strict` also stops on undefined behaviour (16-bit address overflow in
@@ -209,11 +212,33 @@ lockstep comparison can be exact.
    read-only.
 8. A misaligned word access is a fatal trap; hardware ignores address bit 0.
 
+## Embedding it
+
+The library is what the command line is built on, and it can stand in for a
+part: a debugger's tests can run a whole session against it.
+
+- `MemMap` describes a device's layout (flash size, mirror, RAM start, end
+  of the 2nd SFRs); `Memory::new(map)`, then `Cpu::new(mem, core)`.
+- `Cpu::step` runs one instruction; `Cpu::run` and `run_until` run to a
+  clock limit, an address or a stop.
+- `Memory::poke` writes memory from outside: a debugger's memory writes,
+  flash programming. The CPU drops instructions it decoded from those bytes
+  before running the next one. After writing `Memory::b` directly, call
+  `Memory::mark_written`.
+- An `Io` hook (`Memory::set_io`) models peripherals: it sees every data
+  read and store of the SFRs (except the CPU registers at FFFF8H-FFFFFH)
+  and the 2nd SFRs, can supply the value read or take the store, gets the
+  memory to change other state, and can end the run with
+  `Memory::stop_for_io` (`Stop::Io`). `Memory::io_mut::<T>()` gives the
+  hook back to the embedder.
+
+`tests/embed.rs` shows each of these.
+
 ## Limits
 
 - No interrupts.
 - No peripherals other than the UART0 data register and the G13
-  multiplier/divider.
+  multiplier/divider; an embedder adds others with an `Io` hook.
 - Clock counts are CPU clocks from the manual's tables. Anything outside
   the core (oscillator start-up, flash wait states at high frequency) is not
   modelled.

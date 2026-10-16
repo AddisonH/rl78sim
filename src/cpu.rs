@@ -50,6 +50,8 @@ pub enum Stop {
     Limit,
     /// The stop address (--stop) was reached.
     Breakpoint(u32),
+    /// An `Io` hook asked to stop (`Memory::stop_for_io`).
+    Io,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -695,6 +697,16 @@ impl Cpu {
         Some(i)
     }
 
+    /// Catch up with changes made from outside since the last instruction:
+    /// PSW (the register bank) and code (`Memory::poke`, `mark_written`).
+    #[inline]
+    fn enter(&mut self) {
+        self.rb = self.bank_base();
+        if self.mem.wrote_code {
+            self.flush_cache();
+        }
+    }
+
     fn flush_cache(&mut self) {
         for (a, m) in self.mem.code_mark.iter_mut().enumerate() {
             if *m != 0 {
@@ -707,7 +719,7 @@ impl Cpu {
 
     /// Execute one instruction (or one skipped instruction slot).
     pub fn step(&mut self) -> Option<Stop> {
-        self.rb = self.bank_base();
+        self.enter();
         if self.prof.is_some() {
             self.step_impl::<true>()
         } else {
@@ -846,6 +858,9 @@ impl Cpu {
         }
         if let Some(f) = self.mem.fault.take() {
             return Some(Stop::Fault(f));
+        }
+        if std::mem::take(&mut self.mem.io_stop) {
+            return Some(Stop::Io);
         }
         if self.strict {
             if let Some(u) = self.ub.take() {
@@ -1501,7 +1516,7 @@ impl Cpu {
     }
 
     fn run_fast<const PROF: bool>(&mut self, max_clocks: u64) -> Stop {
-        self.rb = self.bank_base();
+        self.enter();
         while self.n.clocks < max_clocks {
             if let Some(s) = self.step_impl::<PROF>() {
                 return s;

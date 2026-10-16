@@ -394,6 +394,7 @@ fn describe(s: &Stop) -> String {
         Stop::Undefined(u) => format!("undefined behaviour: {u}"),
         Stop::Limit => "clock limit".into(),
         Stop::Breakpoint(a) => format!("reached {a:#07x}"),
+        Stop::Io => "stopped by a peripheral".into(),
     }
 }
 
